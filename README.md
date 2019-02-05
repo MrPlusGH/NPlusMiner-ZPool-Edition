@@ -2,7 +2,7 @@ Copyright (c) 2018 MrPlus	(https://github.com/MrPlusGH/NPlusMiner)
 
 Copyright (c) 2018 Nemo		(https://github.com/nemosminer/NemosMiner)
 
-![alt text](https://github.com/MrPlusGH/NPlusMiner/raw/master/Includes/NPM.png)
+![alt text](https://www.zpool.ca/images/logoz.png)
  # NPlusMiner ZPool Edition
   
  Readme Updated 2019 February 5
