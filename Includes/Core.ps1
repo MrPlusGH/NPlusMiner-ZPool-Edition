@@ -1,7 +1,7 @@
 <#
 This file is part of NPlusMiner
 Copyright (c) 2018 Nemo
-Copyright (c) 2018 MrPlus
+Copyright (c) 2018-2019 MrPlus
 
 NPlusMiner is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -20,8 +20,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 <#
 Product:        NPlusMiner
 File:           Core.ps1
-version:        4.6.3
-version date:   20190129
+version:        5.9.9
+version date:   20191110
 #>
 
 Function InitApplication {
@@ -37,12 +37,9 @@ Function InitApplication {
     Set-Location (Split-Path $script:MyInvocation.MyCommand.Path)
     Get-ChildItem . -Recurse | Unblock-File
 
-    if (Get-MpComputerStatus -ErrorAction SilentlyContinue) {
-        Update-Status("INFO: Adding $($Variables.CurrentProduct) path to Windows Defender's exclusions..")
-        try {if ((Get-MpPreference).ExclusionPath -notcontains (Convert-Path .)) {Start-Process powershell -Verb runAs -ArgumentList "Add-MpPreference -ExclusionPath '$(Convert-Path .)'"}}catch {}
-    } 
-    else {
-        Update-Status("INFO: Windows Defender is disabled, make sure to exclude $($Variables.CurrentProduct) directory from your antivirus program")
+    if (Get-Command "Unblock-File" -ErrorAction SilentlyContinue) { Get-ChildItem . -Recurse | Unblock-File }
+    if ((Get-Command "Get-MpPreference" -ErrorAction SilentlyContinue) -and (Get-MpPreference).ExclusionPath -notcontains (Convert-Path .)) {
+        Start-Process (@{desktop = "powershell"; core = "pwsh" }.$PSEdition) "-Command Import-Module '$env:Windir\System32\WindowsPowerShell\v1.0\Modules\Defender\Defender.psd1'; Add-MpPreference -ExclusionPath '$(Convert-Path .)'" -Verb runAs
     }
 
     if($Proxy -eq ""){$PSDefaultParameterValues.Remove("*:Proxy")}
@@ -64,7 +61,7 @@ Function InitApplication {
     #Set donation parameters
     $Variables | Add-Member -Force @{DonateRandom = [PSCustomObject]@{}}
     $Variables | Add-Member -Force @{LastDonated = (Get-Date).AddDays(-1).AddHours(1)}
-    If ($Config.Donate -lt 3) {$Config.Donate = (0,(3..8)) | Get-Random}
+    # If ($Config.Donate -lt 3) {$Config.Donate = (0,(3..8)) | Get-Random}
     $Variables | Add-Member -Force @{WalletBackup = $Config.Wallet}
     $Variables | Add-Member -Force @{UserNameBackup = $Config.UserName}
     $Variables | Add-Member -Force @{WorkerNameBackup = $Config.WorkerName}
@@ -92,6 +89,11 @@ Function InitApplication {
         $StartPort = $Port+1
     }
     Sleep 2
+    
+    # Copy nvml.dll to proper location as latest drivers miss it
+    If ( (! (Test-Path "C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll")) -and (Test-Path "c:\Windows\System32\nvml.dll") ) {
+        Copy-Item "c:\Windows\System32\nvml.dll" "C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll" -Force -ErrorAction Ignore
+    }
 }
 
 Function Start-ChildJobs {
@@ -144,7 +146,7 @@ $CycleTime = Measure-Command -Expression {
         $Variables.ActiveMinerPrograms | ForEach {
             if($_.Process -eq $null -or $_.Process.HasExited)
             {
-                if($_.Status -eq "Running"){$_.Status = "Failed"}
+                if($_.Status -eq "Running"){$_.Status = "Failed";$_.FailedCount++}
             }
             else
             {
@@ -175,15 +177,38 @@ $CycleTime = Measure-Command -Expression {
             # Get donation addresses randomly from agreed developers list
             # This will fairly distribute donations to Developers
             # Developers list and wallets is publicly available at: http://tiny.cc/r355qy 
+            $Variables.StatusText = "ENTERING DONATION"
+            $Variables | Add-Member -Force @{ DonationRunning = $True }
+            $Config.PartyWhenAvailable = $False
             try {$Donation = Invoke-WebRequest "http://tiny.cc/r355qy" -TimeoutSec 15 -UseBasicParsing -Headers @{"Cache-Control"="no-cache"} | ConvertFrom-Json} catch {$Donation = @([PSCustomObject]@{Name = "mrplus";Wallet = "134bw4oTorEJUUVFhokDQDfNqTs7rBMNYy";UserName = "mrplus"},[PSCustomObject]@{Name = "nemo";Wallet = "1QGADhdMRpp9Pk5u5zG1TrHKRrdK5R81TE";UserName = "nemo"})}
             if ($Donation -ne $null) {
                 If ($Config.Donate -lt 3) {$Config.Donate = (0,(3..8)) | Get-Random}
                 $Variables.DonateRandom = $Donation | Get-Random
-                $Config | Add-Member -Force @{PoolsConfig = [PSCustomObject]@{default=[PSCustomObject]@{Wallet = $Variables.DonateRandom.Wallet;UserName = $Variables.DonateRandom.UserName;WorkerName = "$($Variables.CurrentProduct)$($Variables.CurrentVersion.ToString().replace('.',''))";PricePenaltyFactor=1}}}
+                $DevPoolsConfig = [PSCustomObject]@{default = [PSCustomObject]@{Wallet = $Variables.DonateRandom.Wallet;UserName = $Variables.DonateRandom.UserName;WorkerName = "$($Variables.CurrentProduct)$($Variables.CurrentVersion.ToString().replace('.',''))";PricePenaltyFactor=1}}
+                $Config | Add-Member -Force @{PoolsConfig = Merge-PoolsConfig -Main $Config.PoolsConfig -Secondary $DevPoolsConfig}
+                If ($Variables.DonateRandom.PoolsConfURL) {
+                    # Get Dev Pools Config
+                    try {
+                        $DevPoolsConfig = Invoke-WebRequest $Variables.DonateRandom.PoolsConfURL -TimeoutSec 15 -UseBasicParsing -Headers @{"Cache-Control"="no-cache"} | ConvertFrom-Json
+                    } catch {
+                        $DevPoolsConfig = [PSCustomObject]@{default = [PSCustomObject]@{Wallet = $Variables.DonateRandom.Wallet;UserName = $Variables.DonateRandom.UserName;WorkerName = "$($Variables.CurrentProduct)$($Variables.CurrentVersion.ToString().replace('.',''))";PricePenaltyFactor=1}}
+                    }
+                    If ($DevPoolsConfig -ne $null) {
+                        $DevPoolsConfig | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | foreach { $DevPoolsConfig.$_.WorkerName = "$($Variables.CurrentProduct)$($Variables.CurrentVersion.ToString().replace('.',''))" }
+                        $Config | Add-Member -Force @{PoolsConfig = Merge-PoolsConfig -Main $Config.PoolsConfig -Secondary $DevPoolsConfig}
+                        If ( $Variables.DonateRandom.ForcePoolList -and (Compare-Object ((Get-ChildItem ".\Pools").BaseName | sort -Unique) $Variables.DonateRandom.PoolList -IncludeEqual -ExcludeDifferent)) {
+                            $Config.PoolName = $Variables.DonateRandom.PoolList
+                        }
+                        rv DevPoolsConfig
+                    }
+                }
             }
         }
-        if(((Get-Date).AddDays(-1) -ge $Variables.LastDonated -and $Variables.DonateRandom.Wallet -ne $Null) -or (! $Config.PoolsConfig))
-        {
+        if(((Get-Date).AddDays(-1) -ge $Variables.LastDonated -and $Variables.DonateRandom.Wallet -ne $Null) -or (! $Config.PoolsConfig)){
+            If ($Variables.DonationRunning) {$Variables.StatusText = "EXITING DONATION"}
+            $Variables | Add-Member -Force @{ DonationRunning = $False }
+            $ConfigLoad = Get-Content $Config.ConfigFile | ConvertFrom-json
+            $ConfigLoad | % {$_.psobject.properties | sort Name | % {$Config | Add-Member -Force @{$_.Name = $_.Value}}}
             $Config | Add-Member -Force -MemberType ScriptProperty -Name "PoolsConfig" -Value {
                 If (Test-Path ".\Config\PoolsConfig.json"){
                     get-content ".\Config\PoolsConfig.json" | ConvertFrom-json
@@ -200,9 +225,11 @@ $CycleTime = Measure-Command -Expression {
             $Variables.DonateRandom = [PSCustomObject]@{}
         }
         $Variables.StatusText = "Loading BTC rate from 'api.coinbase.com'.."
-        $Rates = Invoke-RestMethod "https://api.coinbase.com/v2/exchange-rates?currency=BTC" -TimeoutSec 15 -UseBasicParsing | Select-Object -ExpandProperty data | Select-Object -ExpandProperty rates
-        $Config.Currency | Where-Object {$Rates.$_} | ForEach-Object {$Rates | Add-Member $_ ([Double]$Rates.$_) -Force}
-        $Variables | Add-Member -Force @{Rates = $Rates}
+        Try{
+            $Rates = Invoke-RestMethod "https://api.coinbase.com/v2/exchange-rates?currency=BTC" -TimeoutSec 15 -UseBasicParsing | Select-Object -ExpandProperty data | Select-Object -ExpandProperty rates
+            $Config.Currency | Where-Object {$Rates.$_} | ForEach-Object {$Rates | Add-Member $_ ([Double]$Rates.$_) -Force}
+            $Variables | Add-Member -Force @{Rates = $Rates}
+        } catch {$Variables.StatusText = "Minor error - Failed to load BTC rate.."}
         #Load the Stats
         $Stats = [PSCustomObject]@{}
         if(Test-Path "Stats"){Get-ChildItemContent "Stats" | ForEach {$Stats | Add-Member $_.Name $_.Content}}
@@ -215,13 +242,13 @@ $CycleTime = Measure-Command -Expression {
 				Where {$_.SSL -EQ $Config.SSL -and ($Config.PoolName.Count -eq 0 -or ($_.Name -in $Config.PoolName)) -and (!$Config.Algorithm -or ((!($Config.Algorithm | ? {$_ -like "+*"}) -or $_.Algorithm -in ($Config.Algorithm | ? {$_ -like "+*"}).Replace("+","")) -and (!($Config.Algorithm | ? {$_ -like "-*"}) -or $_.Algorithm -notin ($Config.Algorithm | ? {$_ -like "-*"}).Replace("-",""))) )}
             }
                 if ($AllPools.Count -eq 0) {
-				$Variables.StatusText = "! Error contacting pool retrying in 30 seconds.."
+				$Variables.StatusText = "Waiting for pool data. retrying in 30 seconds.."
 				Sleep 30
 			}
 		} While ($AllPools.Count -eq 0)
         $Variables.StatusText = "Computing pool stats.."
         # Use location as preference and not the only one
-        $LocPools = $AllPools | ?{$_.location -eq $Config.Location}
+        $LocPools = @($AllPools | ?{$_.location -eq $Config.Location})
         $AllPools = $LocPools + ($AllPools | ? {$_.name -notin $LocPools.name})
         rv LocPools
         # Filter Algo based on Per Pool Config
@@ -232,8 +259,10 @@ $CycleTime = Measure-Command -Expression {
         $Pools = [PSCustomObject]@{}
         $Pools_Comparison = [PSCustomObject]@{}
         $AllPools.Algorithm | Sort -Unique | ForEach {
-            $Pools | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort Price -Descending | Select -First 1)
-            $Pools_Comparison | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort StablePrice -Descending | Select -First 1)
+            # $Pools | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort Price -Descending | Select -First 1)
+            # $Pools_Comparison | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort StablePrice -Descending | Select -First 1)
+            $Pools | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort Price -Descending)
+            $Pools_Comparison | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort StablePrice -Descending)
         }
         # $AllPools.Algorithm | Select -Unique | ForEach {$Pools_Comparison | Add-Member $_ ($AllPools | Where Algorithm -EQ $_ | Sort StablePrice -Descending | Select -First 1)}
         #Load information about the Miners
@@ -250,16 +279,14 @@ $CycleTime = Measure-Command -Expression {
         } else {
             Compare-Object $Variables.MinersHash (Get-ChildItem .\Miners\ -filter "*.ps1" | Get-FileHash) -Property "Hash","Path" | Sort "Path" -Unique | % {
                 $Variables.StatusText = "Miner Updated: $($_.Path)"
-                $NewMiner =  &$_.path
+                $NewMiner =  &$_.path | select -first 1
                 $NewMiner | Add-Member -Force @{Name = (Get-Item $_.Path).BaseName}
-                If (Test-Path (Split-Path $NewMiner.Path)) {
+                If ($NewMiner.Path -and (Test-Path (Split-Path $NewMiner.Path))) {
                     $Variables.ActiveMinerPrograms | Where { $_.Status -eq "Running" -and $_.Path -eq (Resolve-Path $NewMiner.Path)} | ForEach {
-                        [Array]$filtered = ($BestMiners_Combo | Where Path -EQ $_.Path | Where Arguments -EQ $_.Arguments)
-                        if($filtered.Count -eq 0)
-                        {
                             if($_.Process -eq $null)
                             {
                                 $_.Status = "Failed"
+                                $_.FailedCount++
                             }
                             elseif($_.Process.HasExited -eq $false)
                             {
@@ -273,9 +300,9 @@ $CycleTime = Measure-Command -Expression {
                             }
                             #Restore Bias for non-active miners
                             $Variables.Miners | Where Path -EQ $_.Path | Where Arguments -EQ $_.Arguments | ForEach {$_.Profit_Bias = $_.Profit_Bias_Orig}
-                        }
                     }
-                    Get-ChildItem -path ".\stats\" -filter "$($NewMiner.Name)_*.txt" | Remove-Item -Force -Recurse
+                    # Force re-benchmark - Deactivated
+                    # Get-ChildItem -path ".\stats\" -filter "$($NewMiner.Name)_*.txt" | Remove-Item -Force -Recurse
                     Remove-Item -Force -Recurse (Split-Path $NewMiner.Path)
                 }
                 $Variables.MinersHash = Get-ChildItem .\Miners\ -filter "*.ps1" | Get-FileHash
@@ -287,19 +314,108 @@ $CycleTime = Measure-Command -Expression {
         $Variables.StatusText = "Loading miners.."
         $Variables | Add-Member -Force @{Miners = @()}
         $StartPort=4068
+    
+    # Better load here than in miner file. Reduces disk reads.
+    # $MinersConfig = If (Test-Path ".\Config\MinersConfig.json") { Get-content ".\Config\MinersConfig.json" | convertfrom-json }
+    $Script:MinerCustomConfig = Get-Content ".\Config\MinerCustomConfig.json" | ConvertFrom-Json
+    $Script:MinerCustomConfigCode = Get-Content ".\Includes\MinerCustomConfig.ps1" -raw
 
     $Variables.Miners = if (Test-Path "Miners") {
         @(
             Get-ChildItemContent "Miners"
             if ($Config.IncludeOptionalMiners -and (Test-Path "OptionalMiners")) {Get-ChildItemContent "OptionalMiners"}
             if (Test-Path "CustomMiners") { Get-ChildItemContent "CustomMiners"}
-        ) | ForEach {$_.Content | Add-Member @{Name = $_.Name} -PassThru} |
+        ) | ForEach {
+                $Miner = $_.Content | Add-Member @{Name = $_.Name} -PassThru
+
+                # $Miner = $_
+                $Miner_HashRates = [PSCustomObject]@{}
+                $Miner_Pools = [PSCustomObject]@{}
+                $Miner_Pools_Comparison = [PSCustomObject]@{}
+                $Miner_Profits = [PSCustomObject]@{}
+                $Miner_Profits_Comparison = [PSCustomObject]@{}
+                $Miner_Profits_Bias = [PSCustomObject]@{}
+                $Miner_Types = $Miner.Type | Select -Unique
+                $Miner_Indexes = $Miner.Index | Select -Unique
+                $Miner.HashRates | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | ForEach {
+                    $LocPool = $Pools.$_ | ? {$_.Host -eq $Miner.Host -and $_.Coin -eq $Miner.Coin}
+                    $LocPoolsComp = $Pools_Comparison.$_ | ? {$_.Host -eq $Miner.Host -and $_.Coin -eq $Miner.Coin}
+                    $Miner_HashRates | Add-Member $_ ([Double]$Miner.HashRates.$_)
+                    $Miner_Pools | Add-Member $_ ([PSCustomObject]$LocPool)
+                    $Miner_Pools_Comparison | Add-Member $_ ([PSCustomObject]$LocPoolsComp | ? {$_.Host -eq $Miner.Host -and $_.Coin -eq $Miner.Coin})
+                    $Miner_Profits | Add-Member $_ ([Double]$Miner.HashRates.$_*$LocPool.Price)
+                    $Miner_Profits_Comparison | Add-Member $_ ([Double]$Miner.HashRates.$_*$LocPoolsComp.Price)
+                    $Miner_Profits_Bias | Add-Member $_ ([Double]$Miner.HashRates.$_*$LocPool.Price*(1-($Config.MarginOfError*[Math]::Pow($Variables.DecayBase,$DecayExponent))))
+                }
+                $Miner_Profit = [Double]($Miner_Profits.PSObject.Properties.Value | Measure -Sum).Sum
+                $Miner_Profit_Comparison = [Double]($Miner_Profits_Comparison.PSObject.Properties.Value | Measure -Sum).Sum
+                $Miner_Profit_Bias = [Double]($Miner_Profits_Bias.PSObject.Properties.Value | Measure -Sum).Sum
+                $Miner.HashRates | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | ForEach {
+                    if(-not [String]$Miner.HashRates.$_)
+                    {
+                        $Miner_HashRates.$_ = $null
+                        $Miner_Profits.$_ = $null
+                        $Miner_Profits_Comparison.$_ = $null
+                        $Miner_Profits_Bias.$_ = $null
+                        $Miner_Profit = $null
+                        $Miner_Profit_Comparison = $null
+                        $Miner_Profit_Bias = $null
+                    }
+                }
+                if($Miner_Types -eq $null){$Miner_Types = $Variables.Miners.Type | Select -Unique}
+                if($Miner_Indexes -eq $null){$Miner_Indexes = $Variables.Miners.Index | Select -Unique}
+                if($Miner_Types -eq $null){$Miner_Types = ""}
+                if($Miner_Indexes -eq $null){$Miner_Indexes = 0}
+                $Miner.HashRates = $Miner_HashRates
+                $Miner | Add-Member Pools $Miner_Pools
+                $Miner | Add-Member Profits $Miner_Profits
+                $Miner | Add-Member Profits_Comparison $Miner_Profits_Comparison
+                $Miner | Add-Member Profits_Bias $Miner_Profits_Bias
+                $Miner | Add-Member Profit $Miner_Profit
+                $Miner | Add-Member Profit_Comparison $Miner_Profit_Comparison
+                $Miner | Add-Member Profit_Bias $Miner_Profit_Bias
+                $Miner | Add-Member Profit_Bias_Orig $Miner_Profit_Bias
+                $Miner | Add-Member Type $Miner_Types -Force
+                $Miner | Add-Member Index $Miner_Indexes -Force
+                # $Miner.Path = Convert-Path $Miner.Path
+
+                $Miner_Devices = $Miner.Device | Select -Unique
+                if($Miner_Devices -eq $null){$Miner_Devices = ($Variables.Miners | Where {(Compare $Miner.Type $_.Type -IncludeEqual -ExcludeDifferent | Measure).Count -gt 0}).Device | Select -Unique}
+                if($Miner_Devices -eq $null){$Miner_Devices = $Miner.Type}
+                $Miner | Add-Member Device $Miner_Devices -Force
+                $Miner
+            } |
             Where {$Config.Type.Count -eq 0 -or (Compare $Config.Type $_.Type -IncludeEqual -ExcludeDifferent | Measure).Count -gt 0} | 
             Where {!($Config.Algorithm | ? {$_.StartsWith("+")}) -or (Compare (($Config.Algorithm | ? {$_.StartsWith("+")}).Replace("+", "")) $_.HashRates.PSObject.Properties.Name -IncludeEqual -ExcludeDifferent | Measure).Count -gt 0} | 
             Where {$Config.MinerName.Count -eq 0 -or (Compare $Config.MinerName $_.Name -IncludeEqual -ExcludeDifferent | Measure).Count -gt 0}
     }
+    
+    # 5.2.1
+    # Added sceurity to filter miners with no user name in case of malformed miner or pool file
+    $Variables.Miners = $Variables.Miners | ? {$_.User}
 
-        $Variables.Miners = $Variables.Miners | ForEach {
+    # 5.2.1
+    # Exclude non benchmarked during donation.
+    If ($Variables.DonationRunning) {
+        $Variables.Miners = $Variables.Miners | ? {$_.HashRates.Psobject.properties.value}
+    }
+
+    
+        # Ban miners if too many failures as defined by MaxMinerFailure
+        # 0 means no ban
+        # Int value means ban after x failures
+        # defaults to 3 if no value in config
+        # ** Ban is not persistent across sessions **
+       If ($Config.MaxMinerFailure -gt 0){
+           $Config | Add-Member -Force @{ MaxMinerFailure = If ($Config.MaxMinerFailure) {$Config.MaxMinerFailure} else {3} }
+           $BannedMiners = $Variables.ActiveMinerPrograms | Where { $_.Status -eq "Failed" -and $_.FailedCount -ge $Config.MaxMinerFailure }
+           # $BannedMiners | foreach { $Variables.StatusText = "BANNED: $($_.Name) / $($_.Algorithms). Too many failures. Consider Algo exclusion in config." }
+           $BannedMiners | foreach { "BANNED: $($_.Name) / $($_.Algorithms). Too many failures. Consider Algo exclusion in config." | Out-Host }
+           $Variables.Miners = $Variables.Miners | Where { $_.Path -notin $BannedMiners.Path -and $_.Arguments -notin $BannedMiners.Arguments }
+       }
+
+
+        $Variables.Miners | ? { (Test-Path $_.Path) -eq $false } | ForEach {
             $Miner = $_
             if((Test-Path $Miner.Path) -eq $false)
             {
@@ -334,69 +450,15 @@ $CycleTime = Measure-Command -Expression {
                 $Miner
             }
         }
+
+
+    $Variables.Miners = $Variables.Miners | ? { (Test-Path $_.Path) -eq $true }
+
         $Variables.StatusText = "Comparing miners and pools.."
         if($Variables.Miners.Count -eq 0){$Variables.StatusText = "No Miners!"}#; sleep $Config.Interval; continue}
 
-        $Variables.Miners | ForEach {
-            $Miner = $_
-            $Miner_HashRates = [PSCustomObject]@{}
-            $Miner_Pools = [PSCustomObject]@{}
-            $Miner_Pools_Comparison = [PSCustomObject]@{}
-            $Miner_Profits = [PSCustomObject]@{}
-            $Miner_Profits_Comparison = [PSCustomObject]@{}
-            $Miner_Profits_Bias = [PSCustomObject]@{}
-            $Miner_Types = $Miner.Type | Select -Unique
-            $Miner_Indexes = $Miner.Index | Select -Unique
-            $Miner.HashRates | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | ForEach {
-                $Miner_HashRates | Add-Member $_ ([Double]$Miner.HashRates.$_)
-                $Miner_Pools | Add-Member $_ ([PSCustomObject]$Pools.$_)
-                $Miner_Pools_Comparison | Add-Member $_ ([PSCustomObject]$Pools_Comparison.$_)
-                $Miner_Profits | Add-Member $_ ([Double]$Miner.HashRates.$_*$Pools.$_.Price)
-                $Miner_Profits_Comparison | Add-Member $_ ([Double]$Miner.HashRates.$_*$Pools_Comparison.$_.Price)
-                $Miner_Profits_Bias | Add-Member $_ ([Double]$Miner.HashRates.$_*$Pools.$_.Price*(1-($Config.MarginOfError*[Math]::Pow($Variables.DecayBase,$DecayExponent))))
-            }
-            $Miner_Profit = [Double]($Miner_Profits.PSObject.Properties.Value | Measure -Sum).Sum
-            $Miner_Profit_Comparison = [Double]($Miner_Profits_Comparison.PSObject.Properties.Value | Measure -Sum).Sum
-            $Miner_Profit_Bias = [Double]($Miner_Profits_Bias.PSObject.Properties.Value | Measure -Sum).Sum
-            $Miner.HashRates | Get-Member -MemberType NoteProperty | Select -ExpandProperty Name | ForEach {
-                if(-not [String]$Miner.HashRates.$_)
-                {
-                    $Miner_HashRates.$_ = $null
-                    $Miner_Profits.$_ = $null
-                    $Miner_Profits_Comparison.$_ = $null
-                    $Miner_Profits_Bias.$_ = $null
-                    $Miner_Profit = $null
-                    $Miner_Profit_Comparison = $null
-                    $Miner_Profit_Bias = $null
-                }
-            }
-            if($Miner_Types -eq $null){$Miner_Types = $Variables.Miners.Type | Select -Unique}
-            if($Miner_Indexes -eq $null){$Miner_Indexes = $Variables.Miners.Index | Select -Unique}
-            if($Miner_Types -eq $null){$Miner_Types = ""}
-            if($Miner_Indexes -eq $null){$Miner_Indexes = 0}
-            $Miner.HashRates = $Miner_HashRates
-            $Miner | Add-Member Pools $Miner_Pools
-            $Miner | Add-Member Profits $Miner_Profits
-            $Miner | Add-Member Profits_Comparison $Miner_Profits_Comparison
-            $Miner | Add-Member Profits_Bias $Miner_Profits_Bias
-            $Miner | Add-Member Profit $Miner_Profit
-            $Miner | Add-Member Profit_Comparison $Miner_Profit_Comparison
-            $Miner | Add-Member Profit_Bias $Miner_Profit_Bias
-            $Miner | Add-Member Profit_Bias_Orig $Miner_Profit_Bias
-            $Miner | Add-Member Type $Miner_Types -Force
-            $Miner | Add-Member Index $Miner_Indexes -Force
-            $Miner.Path = Convert-Path $Miner.Path
-        }
-        $Variables.Miners | ForEach {
-            $Miner = $_ 
-            $Miner_Devices = $Miner.Device | Select -Unique
-            if($Miner_Devices -eq $null){$Miner_Devices = ($Variables.Miners | Where {(Compare $Miner.Type $_.Type -IncludeEqual -ExcludeDifferent | Measure).Count -gt 0}).Device | Select -Unique}
-            if($Miner_Devices -eq $null){$Miner_Devices = $Miner.Type}
-            $Miner | Add-Member Device $Miner_Devices -Force
-        }
         # Remove miners when no estimation info from pools or 0BTC. Avoids mining when algo down at pool or benchmarking for ever
         If (($Variables.Miners | ? {($_.Pools.PSObject.Properties.Value.Price -ne $null) -and ($_.Pools.PSObject.Properties.Value.Price -gt 0)}).Count -gt 0) {$Variables.Miners = $Variables.Miners | ? {($_.Pools.PSObject.Properties.Value.Price -ne $null) -and ($_.Pools.PSObject.Properties.Value.Price -gt 0)}}
-
         #Don't penalize active miners. Miner could switch a little bit later and we will restore his bias in this case
         $Variables.ActiveMinerPrograms | Where { $_.Status -eq "Running" } | ForEach {$Variables.Miners | Where Path -EQ $_.Path | Where Arguments -EQ $_.Arguments | ForEach {$_.Profit_Bias = $_.Profit * (1 + $Config.ActiveMinerGainPct / 100)}}
         #Get most profitable miner combination i.e. AMD+NVIDIA+CPU
@@ -413,13 +475,20 @@ $CycleTime = Measure-Command -Expression {
         $BestMiners_Combos_Comparison += $Miners_Device_Combos | ForEach {$Miner_Device_Combo = $_.Combination; [PSCustomObject]@{Combination = $Miner_Device_Combo | ForEach {$Miner_Device_Count = $_.Device.Count; [Regex]$Miner_Device_Regex = '^(' + (($_.Device | ForEach {[Regex]::Escape($_)}) -join '|') + ')$'; $BestDeviceMiners_Comparison | Where {([Array]$_.Device -notmatch $Miner_Device_Regex).Count -eq 0 -and ([Array]$_.Device -match $Miner_Device_Regex).Count -eq $Miner_Device_Count}}}}
         $BestMiners_Combo = $BestMiners_Combos | Sort -Descending {($_.Combination | Where Profit -EQ $null | Measure).Count},{($_.Combination | Measure Profit_Bias -Sum).Sum},{($_.Combination | Where Profit -NE 0 | Measure).Count} | Select -First 1 | Select -ExpandProperty Combination
         $BestMiners_Combo_Comparison = $BestMiners_Combos_Comparison | Sort -Descending {($_.Combination | Where Profit -EQ $null | Measure).Count},{($_.Combination | Measure Profit_Comparison -Sum).Sum},{($_.Combination | Where Profit -NE 0 | Measure).Count} | Select -First 1 | Select -ExpandProperty Combination
-
         # No CPU mining if GPU miner prevents it
         If ($BestMiners_Combo.PreventCPUMining -contains $true) {
             $BestMiners_Combo = $BestMiners_Combo | ? {$_.type -ne "CPU"}
             $Variables.StatusText = "Miner prevents CPU mining"
         }
+                
+        If ($Variables.DonationRunning) {
+            $BestMiners_Combo | % {
+                $_.Arguments = $_.Arguments -replace "$($Config.PoolsConfig.Default.WorkerName)","$($Config.PoolsConfig.Default.WorkerName)_$($_.Type)"
+            }
+        }
 
+        $Variables.StatusText = "Assigning miners.."
+        
         #Add the most profitable miners to the active list
         $BestMiners_Combo | ForEach {
             if(($Variables.ActiveMinerPrograms | Where Path -EQ $_.Path | Where Arguments -EQ $_.Arguments).Count -eq 0)
@@ -438,6 +507,7 @@ $CycleTime = Measure-Command -Expression {
                     Active = [TimeSpan]0
                     TotalActive = [TimeSpan]0
                     Activated = 0
+                    FailedCount = 0
                     Status = "Idle"
                     HashRate = 0
                     Benchmarked = 0
@@ -457,6 +527,7 @@ $CycleTime = Measure-Command -Expression {
                 if($_.Process -eq $null)
                 {
                     $_.Status = "Failed"
+                    $_.FailedCount++
                 }
                 elseif ($_.Process.HasExited -eq $false) {
 					$_.Process.CloseMainWindow() | Out-Null
@@ -484,10 +555,27 @@ $CycleTime = Measure-Command -Expression {
             {
                 if($_.Process -eq $null -or $_.Process.HasExited -ne $false)
                 {
-                    # Log switching information to .\log\swicthing.log
-                    [pscustomobject]@{date=(get-date);Type=$_.Type;algo=$_.Algorithms;wallet=$_.User;username=$Config.UserName;Host=$_.host} | export-csv .\Logs\switching.log -Append -NoTypeInformation
+                    # Migrate previous version of .\log\switching.log (Add Coin)
+                    # Move to app init
+                    If (!(Get-Content .\Logs\switching.log -First 1).Contains("coin")) {
+                        $tmp = @()
+                        Import-Csv .\Logs\switching.log | % {$tmp += [PsCustomObject][Ordered]@{date=$_.date;Type=$_.Type;algo=$_.Algo;coin=$_.Coin;wallet=$_.wallet;username=$_.UserName;Host=$_.host}}
+                        $tmp | export-csv .\Logs\switching.log -NoTypeInformation -Force
+                        rv tmp
+                    }
+                    # Log switching information to .\log\switching.log
+                    [pscustomobject]@{date=(get-date);Type=$_.Type;algo=$_.Algorithms;coin=$_.Coin;wallet=$_.User;username=$Config.UserName;Host=$_.host} | export-csv .\Logs\switching.log -Append -NoTypeInformation -Force
 
                     # Launch prerun if exists
+                    If ($_.Type -eq "AMD" -and (Test-Path ".\Prerun\AMDPrerun.bat")) {
+                        Start-Process ".\Prerun\AMDPrerun.bat" -WorkingDirectory ".\Prerun" -WindowStyle hidden
+                    }
+                    If ($_.Type -eq "NVIDIA" -and (Test-Path ".\Prerun\NVIDIAPrerun.bat")) {
+                        Start-Process ".\Prerun\NVIDIAPrerun.bat" -WorkingDirectory ".\Prerun" -WindowStyle hidden
+                    }
+                    If ($_.Type -eq "CPU" -and (Test-Path ".\Prerun\CPUPrerun.bat")) {
+                        Start-Process ".\Prerun\CPUPrerun.bat" -WorkingDirectory ".\Prerun" -WindowStyle hidden
+                    }
                     If ($_.Type -ne "CPU") {
                         $PrerunName = ".\Prerun\"+$_.Algorithms+".bat"
                         $DefaultPrerunName = ".\Prerun\default.bat"
@@ -514,7 +602,7 @@ $CycleTime = Measure-Command -Expression {
 					
                     if($_.Wrap){$_.Process = Start-Process -FilePath "PowerShell" -ArgumentList "-executionpolicy bypass -command . '$(Convert-Path ".\Includes\Wrapper.ps1")' -ControllerProcessID $PID -Id '$($_.Port)' -FilePath '$($_.Path)' -ArgumentList '$($_.Arguments)' -WorkingDirectory '$(Split-Path $_.Path)'" -PassThru}
                     else{$_.Process = Start-SubProcess -FilePath $_.Path -ArgumentList $_.Arguments -WorkingDirectory (Split-Path $_.Path)}
-                    if($_.Process -eq $null){$_.Status = "Failed"}
+                    if($_.Process -eq $null){$_.Status = "Failed";$_.FailedCount++}
                     else {
                         $_.Status = "Running"
                         $newMiner = $true
@@ -550,11 +638,13 @@ $CycleTime = Measure-Command -Expression {
         } else {
         $Variables.TimeToSleep = $Config.Interval
         }
+        # Prevent switching during donation
+        If ( $Variables.DonationRunning ) { If ($Config.Interval -ge ($Config.Donate * 60)) {$Variables.TimeToSleep = $Config.Interval} else {$Variables.TimeToSleep = $Config.Donate * 60 }}
         #Save current hash rates
         $Variables.ActiveMinerPrograms | ForEach {
             if($_.Process -eq $null -or $_.Process.HasExited)
             {
-                if($_.Status -eq "Running"){$_.Status = "Failed"}
+                if($_.Status -eq "Running"){$_.Status = "Failed";$_.FailedCount++}
             }
             else
             {
@@ -578,17 +668,18 @@ $CycleTime = Measure-Command -Expression {
                     }
                 }
             }
-            #Benchmark timeout
-    #        if($_.Benchmarked -ge 6 -or ($_.Benchmarked -ge 2 -and $_.Activated -ge 2))
-    #        {
-    #            for($i = 0; $i -lt $_.Algorithms.Count; $i++)
-    #            {
-    #                if((Get-Stat "$($_.Name)_$($_.Algorithms | Select -Index $i)_HashRate") -eq $null)
-    #                {
-    #                    $Stat = Set-Stat -Name "$($_.Name)_$($_.Algorithms | Select -Index $i)_HashRate" -Value 0
-    #                }
-    #            }
-    #        }
+            
+            # Benchmark timeout
+           # if($_.Benchmarked -ge 6 -or ($_.Benchmarked -ge 3 -and $_.Activated -ge 3))
+           # {
+               # for($i = 0; $i -lt $_.Algorithms.Count; $i++)
+               # {
+                   # if((Get-Stat "$($_.Name)_$($_.Algorithms | Select -Index $i)_HashRate") -eq $null)
+                   # {
+                       # $Stat = Set-Stat -Name "$($_.Name)_$($_.Algorithms | Select -Index $i)_HashRate" -Value 0
+                   # }
+               # }
+           # }
         }
     # }
 
@@ -625,10 +716,23 @@ $CycleTime = Measure-Command -Expression {
 }
     # $Variables.StatusText = "Cycle Time (seconds): $($CycleTime.TotalSeconds)"
     "Cycle Time (seconds): $($CycleTime.TotalSeconds)" | out-host
-    $Variables.StatusText = "Waiting $($Variables.TimeToSleep) seconds... | Next refresh: $((Get-Date).AddSeconds($Variables.TimeToSleep))"
+    If ($variables.DonationRunning) {
+        $Variables.StatusText = "Waiting $($Variables.TimeToSleep) seconds... | Next refresh: $((Get-Date).AddSeconds($Variables.TimeToSleep)) | Donation cycle. Thanks for your support!"
+    } else {
+        $Variables.StatusText = "Waiting $($Variables.TimeToSleep) seconds... | Next refresh: $((Get-Date).AddSeconds($Variables.TimeToSleep))"
+    }
     $Variables | Add-Member -Force @{EndLoop = $True}
     # Sleep $Variables.TimeToSleep
     # }
+# $Variables.BrainJobs | foreach { $_ | stop-job | remove-job }
+# $Variables.BrainJobs = @()
+# $pid | out-host
+# $Variables | convertto-json | out-file ".\logs\variables.json"
+Remove-Variable Stats,Miners_Type_Combos,Miners_Index_Combos,Miners_Device_Combos,BestMiners_Combos,BestMiners_Combos_Comparison,AllPools,Pools,Miner_Pools,Miner_Pools_Comparison,Miner_Profits,Miner_Profits_Comparison,Miner_Profits_Bias,Miner
+# Get-Variable | out-file ".\logs\variables.txt"
+# $StackTrace | convertto-json | out-file ".\logs\stacktrace.json"
+# remove-variable variables
+# Get-MemoryUsage
 }
 #Stop the log
 # Stop-Transcript
